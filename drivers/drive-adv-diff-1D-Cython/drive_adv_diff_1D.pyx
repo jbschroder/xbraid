@@ -6,6 +6,7 @@ cimport mpi4py.libmpi as libmpi
 import numpy as np 
 from scipy.sparse import spdiags, eye, linalg, csr_matrix, coo_matrix
 from scipy.sparse.linalg.interface import LinearOperator
+from numpy.fft import rfft, irfft
 from sys import exit
 from invert_sparse_mat_splu import invert_sparse_mat_splu 
 
@@ -232,8 +233,90 @@ cdef int my_step(braid_App app, braid_Vector ustop, braid_Vector fstop, braid_Ve
             
             pyApp.Phi[level] = LinearOperator(L.shape, matvec=matvec, dtype=L.dtype)
 
+    
     # Take step: make sure to write pyU in-place with [:]
-    pyU.values[:] = pyApp.Phi[level] * pyU.values
+    if( (pyApp.sc == 0) or (pyApp.sc == 1) ):
+        #For no SC, and simple SC, Phi and pyU are sized the same
+        pyU.values[:] = pyApp.Phi[level] * pyU.values
+    
+    elif( pyApp.sc == 2 ):
+        #For unigrid option 1, we need to restrict pyU, apply Phi, and interpolate the result
+        vec = pyU.values
+        ##PP = np.eye(pyApp.Phi[0].shape[0], pyApp.Phi[0].shape[0])
+        ##PP1 = pyApp.Phi[0]*PP
+        for i in range(level):
+            vec = pyApp.R[i]*vec
+        ##    PP = pyApp.R[i]*PP
+        #
+        vec = pyApp.Phi[level] * vec
+        ##PP = pyApp.Phi[level] * PP
+        for i in range(level-1, -1, -1):
+            vec = pyApp.P[i]*vec
+        ##    PP = pyApp.P[i]*PP
+        #
+       #print("\n")
+       #print("\n")
+       #print("Level %d \n"%level)
+       #print(PP[2,:]) 
+       #print(PP[3,:]) 
+       #print(PP[4,:]) 
+       #print(PP[5,:]) 
+       #print(PP[6,:]) 
+       #print("\n")
+       #print(PP1[2,:]) 
+       #print(PP1[3,:]) 
+       #print(PP1[4,:]) 
+       #print(PP1[5,:]) 
+       #print(PP1[6,:]) 
+        pyU.values[:] = vec
+    
+    elif( pyApp.sc == 3 ):
+        #For unigrid option 3, we need to 1. (restrict and then interpolate pyu), 2. apply Phi, 
+        #    and then 3. (restrict and then interpolate pyu), apply Phi, and then 
+        vec = pyU.values
+        for i in range(level):
+            vec = pyApp.R[i]*vec
+        #
+        for i in range(level-1, -1, -1):
+            vec = pyApp.P[i]*vec
+        #
+        vec = pyApp.Phi[level] * vec
+        #
+        for i in range(level):
+            vec = pyApp.R[i]*vec
+        #
+        for i in range(level-1, -1, -1):
+            vec = pyApp.P[i]*vec
+        #
+        pyU.values[:] = vec
+    
+    elif( pyApp.sc == 4 ): 
+        # Use a Fourier transform to mimic spatial coarsening 
+        # Chop off the first floor(  (2^level)-1 / (2^level) ) coefficients   
+        fraction = (2.0**level - 1.0) / 2.0**level
+
+        if level > 0:
+            # Transform, remove coefficients, transform back
+            y = rfft(pyU.values)
+            cutoff = int( y.shape[0] * fraction )
+            y[:cutoff] = 0.0
+            yinv = irfft(y)
+            #print( np.linalg.norm( yinv - pyU.values ), cutoff, y.shape )
+            #print(y.shape, cutoff, pyU.values.shape, yinv.shape, pyApp.Phi[level].shape)
+    
+            # Take Step
+            pyU.values[:] = pyApp.Phi[level] * yinv
+            
+            # (Optional?) Transform, remove coefficients, transform back
+           #y = rfft(pyU.values)
+           #cutoff = int( y.shape[0] * fraction )
+           #y[cutoff: ] = 0.0
+           #yinv = irfft(y)
+           #pyU.values[:] = yinv
+
+        else:
+            # Step normally on level 0
+            pyU.values[:] = pyApp.Phi[level] * pyU.values
 
     return 0
 
@@ -251,10 +334,15 @@ cdef int my_init(braid_App app, double t, braid_Vector *u_ptr):
     # Make sure to change values in-place with [:]
     if t == 0.0:
         mesh_x = np.linspace(0,1.0,nx)
-        indys = np.array( (mesh_x >= 0.25), dtype=int) + np.array( (mesh_x <= 0.5), dtype=int) == 2
+        
+        # Sine hump
         pyU.values = np.sin(2*np.pi*mesh_x)
+        
+        # Isolated Sine hump
+        #indys = np.array( (mesh_x >= 0.25), dtype=int) + np.array( (mesh_x <= 0.5), dtype=int) == 2
         #pyU.values[indys] = -np.sin(4*np.pi*mesh_x[indys])
         
+        # Step function
         #pyU.values[:] = 0.0
         #pyU.values[(nx//10):(nx//5)] = 1.0
         ## If boundary conditions, need to set [0] and [-1] entries
@@ -451,6 +539,43 @@ def interpolation1d(nc):
     P = coo_matrix( (d.ravel(), (I.ravel(), J.ravel()))).tocsr()
     return 0.5 * P[1:-1,:].tocsr()
 
+# 1D Piecewise Constant Interpolation
+# Initial condition is injected 
+def interpolation1d_constant(nc):
+   d = np.repeat([[1, 1]], nc, axis=0).T
+   I = np.zeros((2,nc), dtype=int)
+   for i in range(nc):
+       I[:,i] = [2*i, 2*i+1]
+   J = np.repeat([np.arange(nc)], 2, axis=0)
+   P = coo_matrix( (d.ravel(), (I.ravel(), J.ravel()))).tocsr()
+   return P[1:,:].tocsr()
+
+##
+# 1D quadratic interpolation in space
+def interpolation1d_quadratic(nc):
+    ##
+    nf = 2*(nc-1) + 1
+    P = np.zeros((nf,nc))
+    ##
+    # Do first two and last two rows
+    P[0,0] = 1.0
+    P[1, [0,1,2]] = [ 9./16., 9./16., -1./16. ]
+    P[1, -1] = -1./16.
+    P[-1,-1] = 1.0
+    P[-2, [-3, -2, -1] ] = [ -1./16., 9./16., 9./16. ]
+    P[-2, 0] = -1./16.
+    ##
+    # Loop over all interior rows
+    for i in range(2, nf-2):
+        pt = int(np.floor(i/2))
+        if( (i%2) == 0):
+            P[i, pt ] = 1.0
+        else:
+            P[i, [pt-1, pt, pt+1, pt+2]] = [-1/16., 9./16., 9./16., -1./16. ]
+    ##
+    return csr_matrix(P)
+
+
 ## 1D Injection interpolation, injecting the end points
 ## Input argument is nc, the number of points on the coarse grid
 def injection1d(nc):
@@ -461,6 +586,7 @@ def injection1d(nc):
     J = np.repeat([np.arange(nc)], 1, axis=0)
     P = coo_matrix( (d.ravel(), (I.ravel(), J.ravel())), shape=(2*(nc-1)+1, nc)).tocsr()
     return P
+
 
 
 # Define how to spatially coarsen a Braid vector
@@ -559,7 +685,7 @@ def generate_spatial_disc(nx, a, eps, diff_discr='second_order', advect_discr='u
         # Add fourth-order hyperviscosity
         if advect_discr == 'fourth_diss':
             # Add one order of artificial diss (third order in space)
-            Adv += 1.1*(dx**3)*Dplus*Dplus*Dminus*Dminus
+            Adv += 5.0*(dx**3)*Dplus*Dplus*Dminus*Dminus
 
         elif advect_discr == 'fourth_diss_sq':
             # Add two orders of artificial diss (second order in space)
@@ -608,7 +734,7 @@ def generate_spatial_disc(nx, a, eps, diff_discr='second_order', advect_discr='u
 # printed by the driver, or look at the various braid_Set*() routines below. 
 def InitCoreApp(print_help=False, ml=2, nu=1, nu0=1, CWt=1.0, skip=0, nx=16, ntime=60, 
         eps=1.0, a=1.0, tol=1e-6, cf=2, mi=30, sc=0, fmg=0, advect_discr='upwind', 
-        diff_discr='second_order', time_discr='BE'):
+        diff_discr='second_order', time_discr='BE', access_level=0):
 
     cdef braid_Core core
     cdef double tstart
@@ -635,6 +761,7 @@ def InitCoreApp(print_help=False, ml=2, nu=1, nu0=1, CWt=1.0, skip=0, nx=16, nti
              "  mi   <max_iter>     : set max iterations\n" + \
              "  sc   <scoarsen>     : use spatial coarsening (bilinear) by factor of 2; must use 2^k sized grids\n" + \
              "  fmg                 : use FMG cycling \n" + \
+             "  access_level <int>  : set Braid access level \n" + \
              "  time_discr          : time discretization to use, choose one of \n" + \
              "                      :   'BE', 'FE', 'SDIRK3', 'RK4' \n" + \
              "  diff_discr          : diffusion discretization to use, choose one of \n" + \
@@ -704,29 +831,36 @@ def InitCoreApp(print_help=False, ml=2, nu=1, nu0=1, CWt=1.0, skip=0, nx=16, nti
         for i in range(ml):
             pyApp.L.append(generate_spatial_disc(pyApp.nx[i], a, eps, advect_discr=pyApp.advect_discr, diff_discr=pyApp.diff_discr))
             
-            if(pyApp.sc == 1):
+            # Generate spatial coarsening R and P for any type of spatial coarsening, including unigrid
+            if(pyApp.sc > 0):
                 # Spatial coarsening option is active
                 if(i < num_scoarsen_levels ):
                     # We still have a large enough grid to coarsen 
                     nc = (nx // 2**(i+1)) + 1
                     R = injection1d(nc)
+                    P = interpolation1d(nc)
+                    #P = interpolation1d_quadratic(nc)
+                    #P = interpolation1d_constant(nc)
+                    #pyApp.R.append( 0.5*P.T.tocsr() )
                     pyApp.R.append( R.T.tocsr() )
-                    pyApp.P.append(interpolation1d(nc))
+                    pyApp.P.append( P )
                 else:
                     # We have reached a coarse grid size of 5, so we stop and 
                     # do not change nc
-                    nc = pyApp.nx[-1]
+                    nc = 5 #pyApp.nx[-1]
                     pyApp.R.append( eye( nc, nc, format='csr') )
                     pyApp.P.append( eye( nc, nc, format='csr') )
-            else:
-                # No spatial coarsening
+            
+            if((pyApp.sc == 0) or (pyApp.sc == 3) or (pyApp.sc == 4)):
+                # Options where the operator is never coarsened
                 nc = nx
-
+            
+            # Store spatial mesh sizes
             pyApp.dxs.append( (1.0 - 0.0) / (pyApp.nx[i] - 1.0) )
             if i != ml-1:
                 pyApp.nx.append( nc )
               
-        # Set spatial coarsening
+        # Set spatial coarsening Braid functions only for sc == 1 (don't do for unigrid options 2 and 3)
         if(pyApp.sc == 1):
             # Check that the spatial grid size is a power of 2 plus 1
             if (2**np.floor(np.log2(pyApp.nx[0])) + 1) != pyApp.nx[0]:
@@ -747,7 +881,7 @@ def InitCoreApp(print_help=False, ml=2, nu=1, nu0=1, CWt=1.0, skip=0, nx=16, nti
         braid_SetSkip(pyCore.getCore(), skip)
         braid_SetAbsTol(pyCore.getCore(), tol)
         braid_SetCFactor(pyCore.getCore(), -1, cf)
-        braid_SetAccessLevel(pyCore.getCore(), 1)
+        braid_SetAccessLevel(pyCore.getCore(), access_level)
         braid_SetMaxIter(pyCore.getCore(), mi)
         if fmg == 1:
             braid_SetFMG(pyCore.getCore())
