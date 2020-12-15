@@ -7,7 +7,7 @@ __all__ = ['invert_sparse_mat_splu']
 
 def invert_sparse_mat_splu(A, **kwargs):
     ''' 
-    given a sparse matrix A, return a LinearOperator whose
+    given a sparse matrix A, return a LinearOperator whose  
     application is A-inverse by way of splu
     '''
     
